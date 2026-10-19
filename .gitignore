@@ -1,0 +1,12 @@
+# Employee data never goes into git
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.zip
+*_filtered*/
+
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store

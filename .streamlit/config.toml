@@ -1,0 +1,11 @@
+[server]
+# Only this computer can open the app (it reads and copies local folders).
+address = "localhost"
+showEmailPrompt = false
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
