@@ -67,7 +67,7 @@ def column_filter_widget(df: pd.DataFrame, col: str, ignore_case: bool) -> ff.Co
     if series.map(lambda v: ff.clean_value(v, ignore_case)).nunique() > ff.MAX_LIST_VALUES:
         text = st.text_input(
             f"{col} contains", key=widget_key("contains", col),
-            help="Comma se alag karo; koi bhi ek match ho to row aayegi.",
+            help="Separate terms with commas; a row matches if it contains any of them.",
         )
         return ff.ColumnFilter(col, contains=[t for t in text.split(",") if t.strip()])
     return ff.ColumnFilter(col, values=values_widget(col, series, ignore_case))
@@ -84,19 +84,19 @@ def zip_bytes(upload) -> io.BytesIO:
 
 st.title("Employee documents filter")
 st.caption(
-    "Excel / CSV aur documents ki ZIP upload karo, filter lagao, rows select karo: "
-    "sirf selected employees ke folders ek ZIP mein download honge, same structure mein."
+    "Upload the Excel / CSV and the documents ZIP, apply filters and select rows: only the "
+    "selected employees' folders are downloaded in one ZIP, with the same structure."
 )
 
 st.subheader("1. Upload")
 up_left, up_right = st.columns(2)
 table_upload = up_left.file_uploader("Doc status Excel / CSV", type=["xlsx", "xlsm", "csv"])
 zip_upload = up_right.file_uploader(
-    "Documents ZIP (har employee ka folder = Employee ID)", type=["zip"]
+    "Documents ZIP (one folder per Employee ID)", type=["zip"]
 )
 
 if table_upload is None:
-    st.info("Excel ya CSV file upload karo.")
+    st.info("Upload an Excel or CSV file to start.")
     st.stop()
 
 sheets = read_table(table_upload.getvalue(), table_upload.name)
@@ -106,7 +106,7 @@ with st.expander("Settings: sheets, Employee ID column, filter columns"):
     with set_left:
         sheet_names = st.multiselect("Sheets", list(sheets), default=list(sheets))
     if not sheet_names:
-        st.warning("Kam se kam ek sheet chuno.")
+        st.warning("Select at least one sheet.")
         st.stop()
     df = ff.combine_sheets(sheets, sheet_names)
     columns = [c for c in df.columns if c != ff.SHEET_COLUMN]
@@ -114,13 +114,13 @@ with st.expander("Settings: sheets, Employee ID column, filter columns"):
     with set_right:
         id_col = st.selectbox(
             "Employee ID column", columns, index=columns.index(guessed_id) if guessed_id else 0,
-            help="Is column ki value ZIP ke folder ke naam se match hoti hai.",
+            help="Values in this column are matched with the folder names in the ZIP.",
         )
         ignore_case = st.checkbox(
             "Ignore case, spaces, _ and -", value=True,
-            help="'UNDERGRADUATE', 'Under Graduate' aur 'Under_GRADUATE' ek hi value maane jayenge.",
+            help="'UNDERGRADUATE', 'Under Graduate' and 'Under_GRADUATE' count as the same value.",
         )
-    st.caption("Har filter kis column se bane (sheet ke column names):")
+    st.caption("Which sheet column each filter uses:")
     quick_columns: dict[str, str | None] = {}
     for slot, name in zip(st.columns(len(ff.QUICK_FILTERS)), ff.QUICK_FILTERS):
         guessed = ff.guess_filter_column(df, name)
@@ -138,7 +138,7 @@ if zip_upload is not None:
         with zipfile.ZipFile(zip_bytes(zip_upload)) as zf:
             index = ff.index_zip(zf, known_ids=set(keys))
     except zipfile.BadZipFile:
-        st.error("Ye ZIP file khul nahi rahi. Dobara ZIP banakar upload karo.")
+        st.error("This ZIP file cannot be opened. Create the ZIP again and upload it.")
 
 if index is not None:
     # Only employees whose folder is in the ZIP go further; the rest is skipped.
@@ -147,8 +147,8 @@ if index is not None:
     skipped = df[~matched]
     df, keys = df[matched], keys[matched]
     st.success(
-        f"ZIP se match: {len(df)} employees. "
-        f"{len(skipped)} Excel rows skip hui (unka folder ZIP mein nahi hai)."
+        f"Matched with the ZIP: {len(df)} employees. "
+        f"{len(skipped)} Excel rows skipped (no folder in the ZIP)."
     )
     orphans = [f.name for f in index.folders if not f.keys & excel_ids]
     info_left, info_right = st.columns(2)
@@ -156,12 +156,12 @@ if index is not None:
         with info_left.expander(f"Skipped Excel rows ({len(skipped)})"):
             st.dataframe(skipped, hide_index=True, width="stretch")
     if orphans:
-        with info_right.expander(f"ZIP folders jinki ID Excel mein nahi ({len(orphans)})"):
+        with info_right.expander(f"ZIP folders not found in the Excel ({len(orphans)})"):
             st.write(", ".join(orphans))
     if df.empty:
         st.error(
-            f"ZIP ka koi folder Excel ke '{id_col}' column se match nahi hua. "
-            "Settings mein sahi Employee ID column chuno."
+            f"No folder in the ZIP matches the Excel column '{id_col}'. "
+            "Choose the correct Employee ID column in Settings."
         )
         st.stop()
 
@@ -174,16 +174,16 @@ mask = pd.Series(True, index=df.index)
 for slot, (name, col) in zip(st.columns(len(quick_columns)), quick_columns.items()):
     with slot:
         if col is None:
-            st.multiselect(name, [], placeholder="Settings mein column chuno", disabled=True)
+            st.multiselect(name, [], placeholder="Choose a column in Settings", disabled=True)
             continue
         values = ff.month_values(col, df[col]) if name == "Month" else df[col]
         picked = values_widget(name, values, ignore_case, months=name == "Month")
         mask &= ff.values_mask(values, picked, ignore_case)
 
-with st.expander("More filters (koi bhi column, Employee IDs)"):
+with st.expander("More filters (any column, Employee IDs)"):
     extra_cols = st.multiselect(
-        "Filter by columns", list(df.columns), placeholder="Columns chuno",
-        help="Alag filters AND hote hain; ek filter mein chuni values OR hoti hain.",
+        "Filter by columns", list(df.columns), placeholder="Choose columns",
+        help="Different filters combine with AND; values picked in one filter combine with OR.",
     )
     extra_filters: list[ff.ColumnFilter] = []
     for start in range(0, len(extra_cols), 3):
@@ -194,13 +194,13 @@ with st.expander("More filters (koi bhi column, Employee IDs)"):
 
     pasted = ff.parse_id_list(st.text_area(
         "Employee IDs", height=90,
-        placeholder="80013618, 80011485 ...  (ek line mein ek, ya comma / space se alag)",
+        placeholder="80013618, 80011485 ...  (one per line, or separated by commas / spaces)",
     ))
 if pasted:
     mask &= keys.isin(pasted)
     unknown = sorted(set(pasted) - set(keys))
     if unknown:
-        st.warning(f"{len(unknown)} pasted IDs match nahi hue: {', '.join(unknown)}")
+        st.warning(f"{len(unknown)} pasted IDs did not match: {', '.join(unknown)}")
 
 rows = df[mask]
 
@@ -251,7 +251,7 @@ if index is not None:
 
 st.subheader("4. Download")
 if index is None:
-    st.info("Documents ki ZIP upload karo, phir yahan se selected folders ki ZIP milegi.")
+    st.info("Upload the documents ZIP to download the selected folders here.")
 else:
     def build_download() -> io.BytesIO:
         out = io.BytesIO()
@@ -265,7 +265,7 @@ else:
         data=build_download, file_name=f"{stem}_selected_{len(folders)}.zip",
         mime="application/zip", type="primary", disabled=not folders, on_click="ignore",
     )
-    st.caption("Badi ZIP banne mein click ke baad thoda time lag sakta hai.")
+    st.caption("A large ZIP can take a little while to prepare after you click.")
 
 st.download_button(
     "Download selected list (.xlsx)", ff.selected_list_xlsx(selected),
