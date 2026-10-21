@@ -11,6 +11,7 @@ import io
 import re
 import shutil
 import zipfile
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date
 from typing import BinaryIO, Callable, Iterable
@@ -405,6 +406,62 @@ def build_zip(
                 if progress:
                     progress(written, total)
     return written
+
+
+def clean_path_input(raw: str) -> Path:
+    """A path typed or pasted by the user: tolerates surrounding quotes, '~'
+    and the backslash escapes macOS Terminal adds when a file is dropped in."""
+    text = (raw or "").strip().strip("'\"").strip()
+    path = Path(text).expanduser()
+    if not path.exists() and "\\" in text:
+        unescaped = Path(re.sub(r"\\(.)", r"\1", text)).expanduser()
+        if unescaped.exists():
+            return unescaped
+    return path
+
+
+def find_zip_files(folders: Iterable[Path], limit: int = 50) -> list[Path]:
+    """ZIP files directly inside `folders` (e.g. Downloads, Desktop), newest
+    first, leaving out the ZIPs this app itself saved."""
+    found = []
+    for folder in folders:
+        if folder.is_dir():
+            found += [
+                p for p in folder.glob("*.zip")
+                if p.is_file() and not p.name.startswith(".") and "_selected_" not in p.name
+            ]
+    return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
+def unique_path(path: Path) -> Path:
+    """`path`, or `name (2).zip`, `name (3).zip` ... whichever does not exist yet."""
+    candidate, n = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        n += 1
+    return candidate
+
+
+def save_zip(
+    zf: zipfile.ZipFile,
+    index: ZipIndex,
+    folders: Iterable[ZipFolder],
+    target: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> Path:
+    """Stream the chosen folders into a new ZIP file on disk (memory stays
+    small however big the selection is). Returns the path written, which is
+    `target` or a numbered variant if that name is taken."""
+    target = unique_path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    part = target.with_name(target.name + ".part")
+    try:
+        with part.open("wb") as out:
+            build_zip(zf, index, folders, out, progress)
+        part.replace(target)
+    finally:
+        part.unlink(missing_ok=True)
+    return target
 
 
 def selected_list_xlsx(rows: pd.DataFrame) -> bytes:

@@ -15,6 +15,9 @@ from __future__ import annotations
 import hashlib
 import io
 import zipfile
+from pathlib import Path
+from typing import Callable
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +26,14 @@ import folder_filter as ff
 
 SELECT_COLUMN = "Select"
 FILES_COLUMN = "Files in ZIP"
+# A browser download is built in memory; bigger selections are saved straight to disk.
+BROWSER_ZIP_LIMIT = 1_000_000_000
+# Where "From this computer" looks for ZIPs (a browser upload holds the whole
+# file in memory twice over, so large ZIPs are read from disk instead).
+LARGE_ZIP_FOLDERS = ("Downloads", "Desktop", "Documents")
+
+# The name of the documents ZIP and a function that opens it for zipfile.
+ZipChoice = tuple[str | None, Callable[[], object] | None]
 
 st.set_page_config(page_title="Employee documents filter", layout="wide")
 
@@ -39,7 +50,12 @@ def widget_key(*parts: object) -> str:
 
 
 def size_text(n: int) -> str:
-    return f"{n / 1_048_576:,.1f} MB" if n >= 1_048_576 else f"{n / 1024:,.0f} KB"
+    """Decimal units, as macOS Finder shows them (5,000,000,000 bytes = 5.00 GB)."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:,.2f} GB"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:,.1f} MB"
+    return f"{n / 1000:,.0f} KB"
 
 
 def values_widget(label: str, series: pd.Series, ignore_case: bool, months: bool = False) -> list[str]:
@@ -73,9 +89,38 @@ def column_filter_widget(df: pd.DataFrame, col: str, ignore_case: bool) -> ff.Co
     return ff.ColumnFilter(col, values=values_widget(col, series, ignore_case))
 
 
-def zip_bytes(upload) -> io.BytesIO:
+def is_local_session() -> bool:
+    """True when the browser runs on the same computer as the app, so the
+    ZIP can be written straight into this computer's Downloads folder."""
+    return (urlparse(st.context.url or "").hostname or "") in ("localhost", "127.0.0.1", "::1")
+
+
+def upload_zip(label: str) -> ZipChoice:
+    upload = st.file_uploader(label, type=["zip"])
+    if upload is None:
+        return None, None
     # A private stream per use: reruns and the download never share a read position.
-    return io.BytesIO(upload.getvalue())
+    return upload.name, lambda: io.BytesIO(upload.getvalue())
+
+
+def pick_zip_on_disk() -> ZipChoice:
+    found = ff.find_zip_files(Path.home() / folder for folder in LARGE_ZIP_FOLDERS)
+    picked = st.selectbox(
+        "ZIP in Downloads, Desktop or Documents", found, index=None, placeholder="Choose a ZIP",
+        format_func=lambda p: f"{p.name}  ({size_text(p.stat().st_size)}, {p.parent.name})",
+    )
+    typed = st.text_input(
+        "Or paste the ZIP's full path",
+        help="Mac: right-click the ZIP, hold the Option key, choose 'Copy ... as Pathname' "
+        "and paste it here.",
+    )
+    path = ff.clean_path_input(typed) if typed.strip() else picked
+    if path is None:
+        return None, None
+    if not path.is_file():
+        st.error(f"File not found: {path}")
+        return None, None
+    return path.name, lambda: path
 
 
 # --------------------------------------------------------------------------
@@ -89,11 +134,21 @@ st.caption(
 )
 
 st.subheader("1. Upload")
+local = is_local_session()
 up_left, up_right = st.columns(2)
 table_upload = up_left.file_uploader("Doc status Excel / CSV", type=["xlsx", "xlsm", "csv"])
-zip_upload = up_right.file_uploader(
-    "Documents ZIP (one folder per Employee ID)", type=["zip"]
-)
+with up_right:
+    if local and st.radio(
+        "Documents ZIP (one folder per Employee ID)",
+        ["Upload (up to 2 GB)", "From this computer (large ZIP, 5 GB and more)"],
+        horizontal=True,
+        help="A ZIP on this computer is read straight from disk, so its size does not matter.",
+    ).startswith("From"):
+        zip_name, zip_file = pick_zip_on_disk()
+    else:
+        zip_name, zip_file = upload_zip(
+            "ZIP file (up to 2 GB)" if local else "Documents ZIP (one folder per Employee ID)"
+        )
 
 if table_upload is None:
     st.info("Upload an Excel or CSV file to start.")
@@ -133,12 +188,12 @@ with st.expander("Settings: sheets, Employee ID column, filter columns"):
 keys = ff.id_keys(df, id_col)
 
 index: ff.ZipIndex | None = None
-if zip_upload is not None:
+if zip_file is not None:
     try:
-        with zipfile.ZipFile(zip_bytes(zip_upload)) as zf:
+        with zipfile.ZipFile(zip_file()) as zf:
             index = ff.index_zip(zf, known_ids=set(keys))
-    except zipfile.BadZipFile:
-        st.error("This ZIP file cannot be opened. Create the ZIP again and upload it.")
+    except (zipfile.BadZipFile, OSError):
+        st.error("This ZIP file cannot be opened. Create the ZIP again and choose it.")
 
 if index is not None:
     # Only employees whose folder is in the ZIP go further; the rest is skipped.
@@ -251,23 +306,49 @@ if index is not None:
 
 st.subheader("4. Download")
 if index is None:
-    st.info("Upload the documents ZIP to download the selected folders here.")
+    st.info("Choose the documents ZIP to download the selected folders here.")
 else:
     def build_download() -> io.BytesIO:
         out = io.BytesIO()
-        with zipfile.ZipFile(zip_bytes(zip_upload)) as zf:
+        with zipfile.ZipFile(zip_file()) as zf:
             ff.build_zip(zf, index, folders, out)
         return out
 
-    stem = zip_upload.name.rsplit(".", 1)[0]
-    st.download_button(
-        f"Download ZIP ({len(folders)} folders, {size_text(sum(f.size for f in folders))})",
-        data=build_download, file_name=f"{stem}_selected_{len(folders)}.zip",
-        mime="application/zip", type="primary", disabled=not folders, on_click="ignore",
+    total_size = sum(f.size for f in folders)
+    file_name = f"{zip_name.rsplit('.', 1)[0]}_selected_{len(folders)}.zip"
+    summary = f"{len(folders)} folders, {size_text(total_size)}"
+    fits = total_size <= BROWSER_ZIP_LIMIT
+    actions = st.container(horizontal=True)
+    save = local and actions.button(
+        f"Save ZIP to Downloads ({summary})", type="primary", disabled=not folders
     )
-    st.caption("A large ZIP can take a little while to prepare after you click.")
+    actions.download_button(
+        f"Download ZIP ({summary})", data=build_download, file_name=file_name,
+        mime="application/zip", type="secondary" if local else "primary",
+        disabled=not folders or not fits, on_click="ignore",
+    )
+    if not fits:
+        st.caption(
+            "Selections over 1 GB are too large for a browser download: "
+            + ("use Save ZIP to Downloads." if local
+               else "select fewer employees, or run the app on your computer.")
+        )
+    else:
+        st.caption("A large ZIP can take a little while to prepare after you click.")
 
-st.download_button(
-    "Download selected list (.xlsx)", ff.selected_list_xlsx(selected),
-    file_name="selected_list.xlsx", disabled=selected.empty, on_click="ignore",
-)
+    selection = hashlib.sha1("|".join(f.name for f in folders).encode()).hexdigest()
+    if save:
+        bar = st.progress(0.0, text="Saving ZIP ...")
+        step = max(1, sum(f.files for f in folders) // 200)
+
+        def show(done: int, total: int) -> None:
+            if done == total or done % step == 0:
+                bar.progress(done / total, text=f"Saving ZIP ... {done:,} / {total:,} files")
+
+        with zipfile.ZipFile(zip_file()) as zf:
+            saved = ff.save_zip(zf, index, folders, Path.home() / "Downloads" / file_name, show)
+        bar.empty()
+        st.session_state["saved_zip"] = (selection, saved)
+    last_save = st.session_state.get("saved_zip")
+    if last_save and last_save[0] == selection:
+        st.success(f"Saved: {last_save[1]}")

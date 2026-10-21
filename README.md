@@ -30,7 +30,12 @@ streamlit run app.py --server.address localhost
 
 ## How to use it
 
-1. **Upload** the doc-status Excel (`.xlsx`) or CSV, and the documents ZIP.
+1. **Upload** the doc-status Excel (`.xlsx`) or CSV, and choose the documents ZIP:
+   - **Upload (up to 2 GB)**: pick the ZIP in the browser.
+   - **From this computer (large ZIP, 5 GB and more)**: choose a ZIP from your Downloads, Desktop
+     or Documents folder, or paste its full path (Finder: right-click the ZIP, hold Option,
+     **Copy ... as Pathname**). The ZIP is read straight from disk, so its size does not matter.
+     This option appears when the app runs on your own computer.
    - All sheets (for example `tc` and `field`) are loaded together.
    - **Only employees whose folder is in the ZIP are kept.** Other Excel rows are skipped (listed
      under "Skipped Excel rows"), and ZIP folders whose ID is not in the Excel are listed separately.
@@ -46,8 +51,11 @@ streamlit run app.py --server.address localhost
    - "More filters" adds any other column, or a pasted list of Employee IDs.
 3. **Select**: every row starts ticked; untick the ones you do not want (Select all / Clear all are
    available too). The counters show employees, documents and size of the selection.
-4. **Download**: "Download ZIP" gives the selected employees' folders with their original paths.
-   "Download selected list (.xlsx)" gives the selected rows as an Excel file.
+4. **Download** the selected employees' folders with their original paths:
+   - **Save ZIP to Downloads** (on your own computer) writes the ZIP straight into your Downloads
+     folder, with a progress bar. Any size works; an existing file is never overwritten.
+   - **Download ZIP** downloads through the browser, for selections up to 1 GB.
+   - **Download selected list (.xlsx)** gives the selected rows as an Excel file.
 
 ## How folders are matched to Employee IDs
 
@@ -63,8 +71,17 @@ streamlit run app.py --server.address localhost
 ## Data
 
 When run on your computer (`run_mac.command` or the command above) the app only listens on
-`localhost`; files never leave the machine. ZIPs up to 4 GB can be uploaded
-(`.streamlit/config.toml`). Excel, CSV and ZIP files are in `.gitignore` and never committed.
+`localhost`; files never leave the machine. Excel, CSV and ZIP files are in `.gitignore` and never
+committed.
+
+## Large ZIPs
+
+- A browser upload is held in the app's memory, about 2x the ZIP's size (a 1 GB upload uses about
+  2 GB of RAM), so browser uploads are limited to 2 GB (`.streamlit/config.toml`).
+- **From this computer** + **Save ZIP to Downloads** do not load the ZIP into memory: a 5 GB ZIP
+  with 950 employee folders was opened in under a second and fully saved in about 70 seconds,
+  with the app using under 200 MB of RAM. You need free disk space for the new ZIP (up to the
+  size of the selection).
 
 ## Deploying on Streamlit Community Cloud (share.streamlit.io)
 
@@ -74,7 +91,8 @@ When run on your computer (`run_mac.command` or the command above) the app only 
 - Branch: the repository's default branch. Main file path: `app.py`.
 - On the cloud, the uploaded Excel and documents (Aadhaar, PAN copies) are sent to Streamlit's
   servers: keep the app **private** (only invited emails can open it). Cloud memory is limited
-  (roughly 1-2.7 GB), so a large ZIP (1 GB or more) can crash there; run large ZIPs locally.
+  (roughly 1-2.7 GB), so on the cloud only browser uploads are available and a ZIP over about
+  1 GB can crash there. For 5 GB ZIPs, run the app on your computer.
 
 ## Tests
 

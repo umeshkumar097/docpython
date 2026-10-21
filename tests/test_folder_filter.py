@@ -247,6 +247,59 @@ def test_build_zip_keeps_paths_of_selected_only(export_zip: zipfile.ZipFile) -> 
     assert export_zip.read(f"{EXPORT}80013618/photo.jpg") == b"jpg-1"
 
 
+def test_save_zip_streams_to_disk_without_overwriting(export_zip: zipfile.ZipFile, tmp_path: Path) -> None:
+    index = ff.index_zip(export_zip)
+    target = tmp_path / "Downloads" / "export_selected_1.zip"
+    seen: list[tuple[int, int]] = []
+
+    first = ff.save_zip(export_zip, index, index.by_id["80013618"], target,
+                        progress=lambda i, t: seen.append((i, t)))
+    second = ff.save_zip(export_zip, index, index.by_id["80011485"], target)
+
+    assert first == target
+    assert second == tmp_path / "Downloads" / "export_selected_1 (2).zip"
+    assert seen == [(1, 2), (2, 2)]
+    assert sorted(p.name for p in target.parent.iterdir()) == [
+        "export_selected_1 (2).zip", "export_selected_1.zip"]  # no .part left behind
+    with zipfile.ZipFile(first) as result:
+        assert result.read(f"{EXPORT}80013618/photo.jpg") == b"jpg-1"
+
+
+def test_save_zip_removes_partial_file_on_failure(export_zip: zipfile.ZipFile, tmp_path: Path) -> None:
+    index = ff.index_zip(export_zip)
+
+    def boom(_done: int, _total: int) -> None:
+        raise RuntimeError("disk full")
+
+    with pytest.raises(RuntimeError):
+        ff.save_zip(export_zip, index, index.by_id["80013618"], tmp_path / "out.zip", boom)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_clean_path_input_handles_quotes_tilde_and_terminal_escapes(tmp_path: Path) -> None:
+    zip_path = tmp_path / "Export-2026-09-23 (1).zip"
+    zip_path.write_bytes(b"")
+    escaped = str(zip_path).replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)")
+    assert ff.clean_path_input(escaped) == zip_path
+    assert ff.clean_path_input(f"'{zip_path}' ") == zip_path
+    assert ff.clean_path_input(f'"{zip_path}"') == zip_path
+    assert ff.clean_path_input("~/x.zip") == Path.home() / "x.zip"
+
+
+def test_find_zip_files_newest_first_without_own_outputs(tmp_path: Path) -> None:
+    import os
+
+    downloads, desktop = tmp_path / "Downloads", tmp_path / "Desktop"
+    downloads.mkdir()
+    desktop.mkdir()
+    for i, path in enumerate([downloads / "old.zip", desktop / "new.zip", downloads / "notes.txt",
+                              downloads / "export_selected_49.zip", downloads / ".hidden.zip"]):
+        path.write_bytes(b"")
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+    found = ff.find_zip_files([downloads, desktop, tmp_path / "Missing"])
+    assert [p.name for p in found] == ["new.zip", "old.zip"]
+
+
 def test_selected_list_xlsx(df: pd.DataFrame) -> None:
     back = pd.read_excel(io.BytesIO(ff.selected_list_xlsx(df.iloc[:2])), dtype=str)
     assert list(back["Employee ID"]) == ["80013618", "80011485"]

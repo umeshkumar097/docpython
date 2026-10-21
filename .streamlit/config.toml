@@ -1,6 +1,8 @@
 [server]
 showEmailPrompt = false
-maxUploadSize = 4096  # MB; the documents ZIP can be large
+# MB. A browser upload needs about 2x its size in memory; larger ZIPs use
+# "From this computer", which reads them straight from disk.
+maxUploadSize = 2048
 
 [browser]
 gatherUsageStats = false
