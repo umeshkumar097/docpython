@@ -1,5 +1,6 @@
 from datetime import date
 from pathlib import Path
+import io
 import sys
 import zipfile
 
@@ -10,16 +11,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import folder_filter as ff  # noqa: E402
 
 
+def xlsx_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf) as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+    return buf.getvalue()
+
+
 @pytest.fixture
-def workbook(tmp_path: Path) -> Path:
-    path = tmp_path / "status.xlsx"
+def df() -> pd.DataFrame:
     tc = pd.DataFrame({
         "Registration Date": ["2026-07-08 16:49:59", "2026-07-20 10:00:00", "2026-08-02 09:00:00"],
         "Candidate Name": ["SOMANATH", "AMANDEEP", "KHUSHBU"],
         "Phase": ["Phase 1 August", "Batch 01", "Batch 01"],
         "Employer": ["Home credit ", "HOME CREDIT", "Other Co"],
         "Employee ID": [80013618, "80011485", "080608"],
-        "MD_Employee ID": ["x", "y", "z"],
+        "Selected Qualification": ["UNDERGRADUATE", "Under Graduate", "GRADUATE"],
+        "Qual Document": ["Uploaded"] * 3,
+        "MD_Dra Batch": [None, "Batch 01", "Batch 01"],
+        "MD_Upload Month": ["July 2026", "July 2026", "June 2026"],
+        "MD_Training Month": [None, None, "September 2026"],
+        "MD_Training Language": [None, "Hindi", None],
     })
     field = pd.DataFrame({
         "Registration Date": ["2026-05-30 08:51:44"],
@@ -27,38 +40,82 @@ def workbook(tmp_path: Path) -> Path:
         "Phase": ["June Phase 1"],
         "Employer": [None],
         "Employee ID": ["80004215"],
-        "MD_Active Status": ["Active"],
+        "Selected Qualification": ["Under_GRADUATE"],
+        "MD_Dra Batch": ["Batch 04"],
+        "MD_Upload Month": ["June 2026"],
     })
-    with pd.ExcelWriter(path) as writer:
-        tc.to_excel(writer, sheet_name="tc", index=False)
-        field.to_excel(writer, sheet_name="field", index=False)
-    return path
+    sheets = ff.load_table(xlsx_bytes({"tc": tc, "field": field}), "status.xlsx")
+    return ff.combine_sheets(sheets, ["tc", "field"])
+
+
+def make_zip(files: dict[str, bytes], dirs: tuple[str, ...] = ()) -> zipfile.ZipFile:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for d in dirs:
+            zf.writestr(zipfile.ZipInfo(d), b"")
+        for name, data in files.items():
+            zf.writestr(name, data)
+    buf.seek(0)
+    return zipfile.ZipFile(buf)
+
+
+EXPORT = "Export-2026-09-23 (1)/"
 
 
 @pytest.fixture
-def export(tmp_path: Path) -> Path:
-    root = tmp_path / "Export-2026-09-23 (1)"
-    for name in ["80013618", "80011485", "80004215 - Anshuman", "99999999"]:
-        (root / name).mkdir(parents=True)
-        (root / name / "photo.jpg").write_bytes(b"jpg")
-    (root / "80608_sign.pdf").write_bytes(b"pdf")
-    (root / ".DS_Store").write_bytes(b"")
-    return root
+def export_zip() -> zipfile.ZipFile:
+    return make_zip(
+        {
+            f"{EXPORT}80013618/photo.jpg": b"jpg-1",
+            f"{EXPORT}80013618/id_proof.pdf": b"pdf-1",
+            f"{EXPORT}80011485/photo.jpg": b"jpg-2",
+            f"{EXPORT}80011485/notes.txt": b"text " * 100,
+            f"{EXPORT}80004215 - Anshuman/photo.jpg": b"jpg-3",
+            f"{EXPORT}80608_sign.pdf": b"pdf-4",
+            f"{EXPORT}99999999/photo.jpg": b"jpg-x",
+            f"{EXPORT}.DS_Store": b"",
+            "__MACOSX/Export-2026-09-23 (1)/._80013618": b"",
+        },
+        dirs=(EXPORT, f"{EXPORT}80013618/", f"{EXPORT}80011485/"),
+    )
 
 
-def test_load_and_combine_keeps_ids_as_text(workbook: Path) -> None:
-    sheets = ff.load_workbook(workbook)
-    assert list(sheets) == ["tc", "field"]
-    df = ff.combine_sheets(sheets, ["tc", "field"])
+# -- Excel / CSV ------------------------------------------------------------
+
+
+def test_load_and_combine_keeps_ids_as_text(df: pd.DataFrame) -> None:
     assert list(df[ff.SHEET_COLUMN]) == ["tc", "tc", "tc", "field"]
     assert list(df["Employee ID"]) == ["80013618", "80011485", "080608", "80004215"]
-    assert "MD_Active Status" in df.columns  # columns of both sheets are kept
+    assert "MD_Training Language" in df.columns  # columns of both sheets are kept
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "cp1252"])
+def test_load_csv(encoding: str) -> None:
+    data = "Employee ID,Phase,City\n080608,Batch 01,Pune\n80011485,,Café\n".encode(encoding)
+    sheets = ff.load_table(data, "status.CSV")
+    assert list(sheets) == ["CSV"]
+    assert list(sheets["CSV"]["Employee ID"]) == ["080608", "80011485"]
+    assert sheets["CSV"]["City"][1] == "Café"
 
 
 def test_guess_id_column_prefers_main_column() -> None:
     assert ff.guess_id_column(["Name", "MD_Employee ID", "Employee ID"]) == "Employee ID"
     assert ff.guess_id_column(["MD_Employee ID ", "Name"]) == "MD_Employee ID "
     assert ff.guess_id_column(["Name", "Phone"]) is None
+
+
+def test_guess_filter_columns(df: pd.DataFrame) -> None:
+    assert ff.guess_filter_column(df, "Batch") == "MD_Dra Batch"
+    assert ff.guess_filter_column(df, "Language") == "MD_Training Language"
+    assert ff.guess_filter_column(df, "Education") == "Selected Qualification"
+    assert ff.guess_filter_column(df, "Month") == "MD_Upload Month"  # most filled month column
+    only_phase = pd.DataFrame({"Phase": ["Batch 01"], "Registration Date": ["2026-07-08"]})
+    assert ff.guess_filter_column(only_phase, "Batch") == "Phase"
+    assert ff.guess_filter_column(only_phase, "Month") == "Registration Date"
+    assert ff.guess_filter_column(only_phase, "Language") is None
+
+
+# -- IDs --------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -74,42 +131,58 @@ def test_parse_id_list() -> None:
     assert ff.parse_id_list("80013618, 80011485\n80013618 080608\t") == ["80013618", "80011485", "80608"]
 
 
-def test_scan_export_matches_names_and_leading_numbers(export: Path) -> None:
-    index = ff.scan_export(export)
-    assert [p.name for p in index["80013618"]] == ["80013618"]
-    assert [p.name for p in index["80004215"]] == ["80004215 - Anshuman"]
-    assert [p.name for p in index["80608"]] == ["80608_sign.pdf"]
-    assert not any(p.name == ".DS_Store" for paths in index.values() for p in paths)
+def test_name_keys() -> None:
+    assert ff.name_keys("80013618") == {"80013618"}
+    assert ff.name_keys("80004215 - Anshuman") == {"80004215-ANSHUMAN", "80004215"}
+    assert ff.name_keys("Photos") == {"PHOTOS"}
 
 
-def test_clean_path_input_handles_terminal_escapes(export: Path) -> None:
-    escaped = str(export).replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)")
-    assert ff.clean_path_input(escaped) == export
-    assert ff.clean_path_input(f"'{export}' ") == export
+# -- Filters ----------------------------------------------------------------
 
 
-def test_value_options_group_case_and_spaces(workbook: Path) -> None:
-    df = ff.combine_sheets(ff.load_workbook(workbook), ["tc", "field"])
-    options = ff.value_options(df["Employer"], ignore_case=True)
-    assert options == [("home credit", "Home credit", 2), ("other co", "Other Co", 1),
-                       ("", ff.BLANK_LABEL, 1)]
+def test_clean_value_ignores_case_spaces_and_separators() -> None:
+    variants = ["UNDERGRADUATE", "Under Graduate", "Under_GRADUATE", " under-graduate "]
+    assert {ff.clean_value(v, True) for v in variants} == {"undergraduate"}
+    assert ff.clean_value("  Under   Graduate ", False) == "Under Graduate"
+    assert ff.clean_value(None, True) == ""
+
+
+def test_value_options(df: pd.DataFrame) -> None:
+    assert ff.value_options(df["Selected Qualification"], ignore_case=True) == [
+        ("graduate", "GRADUATE", 1), ("undergraduate", "UNDERGRADUATE", 3)]
+    assert ff.value_options(df["Employer"], ignore_case=True) == [
+        ("homecredit", "Home credit", 2), ("otherco", "Other Co", 1), ("", ff.BLANK_LABEL, 1)]
     strict = ff.value_options(df["Employer"], ignore_case=False)
     assert [o[0] for o in strict] == ["HOME CREDIT", "Home credit", "Other Co", ""]
 
 
-def test_filters_and_or_contains_dates(workbook: Path) -> None:
-    df = ff.combine_sheets(ff.load_workbook(workbook), ["tc", "field"])
+def test_month_values_and_calendar_order(df: pd.DataFrame) -> None:
+    months = ff.month_values("Registration Date", df["Registration Date"])
+    assert list(months) == ["July 2026", "July 2026", "August 2026", "May 2026"]
+    assert [o[1] for o in ff.value_options(months, True, chronological=True)] == [
+        "May 2026", "July 2026", "August 2026"]
+    text = pd.Series(["Sept batch", "July 2026", None, "Jun 2026"])
+    assert ff.month_values("MD_Upload Month", text) is text
+    assert [o[1] for o in ff.value_options(text, True, chronological=True)] == [
+        "Jun 2026", "July 2026", "Sept batch", ff.BLANK_LABEL]
 
+
+def test_values_mask(df: pd.DataFrame) -> None:
+    ids = lambda m: list(df[m]["Employee ID"])  # noqa: E731
+    assert ids(ff.values_mask(df["Selected Qualification"], ["undergraduate"], True)) == [
+        "80013618", "80011485", "80004215"]
+    assert ids(ff.values_mask(df["MD_Dra Batch"], [], True)) == list(df["Employee ID"])
+    assert ids(ff.values_mask(df["MD_Dra Batch"], [""], True)) == ["80013618"]
+
+
+def test_filters_and_or_contains_dates(df: pd.DataFrame) -> None:
     def ids(*filters: ff.ColumnFilter) -> list[str]:
         return list(df[ff.filter_mask(df, filters, ignore_case=True)]["Employee ID"])
 
     assert ids() == list(df["Employee ID"])
-    # OR inside a column
-    assert ids(ff.ColumnFilter("Phase", values=["batch 01", "june phase 1"])) == ["80011485", "080608", "80004215"]
-    # AND across columns
-    assert ids(ff.ColumnFilter("Phase", values=["batch 01"]),
-               ff.ColumnFilter("Employer", values=["home credit"])) == ["80011485"]
-    assert ids(ff.ColumnFilter("Employer", values=[""])) == ["80004215"]
+    assert ids(ff.ColumnFilter("Phase", values=["batch01", "junephase1"])) == ["80011485", "080608", "80004215"]
+    assert ids(ff.ColumnFilter("Phase", values=["batch01"]),
+               ff.ColumnFilter("Employer", values=["homecredit"])) == ["80011485"]
     assert ids(ff.ColumnFilter("Candidate Name", contains=["aman", " khush "])) == ["80011485", "080608"]
     assert ids(ff.ColumnFilter("Registration Date", date_from=date(2026, 7, 8),
                                date_to=date(2026, 7, 20))) == ["80013618", "80011485"]
@@ -124,45 +197,56 @@ def test_parse_dates_keeps_iso_month_and_reads_day_first() -> None:
     assert pd.isna(parsed[2])
 
 
-def test_export_copies_only_selected(workbook: Path, export: Path, tmp_path: Path) -> None:
-    df = ff.combine_sheets(ff.load_workbook(workbook), ["tc", "field"])
-    rows = df[df["Phase"].isin(["Phase 1 August", "Batch 01"])]
-    index = ff.scan_export(export)
+# -- ZIP --------------------------------------------------------------------
+
+
+def test_index_zip_looks_through_wrapper_and_skips_junk(export_zip: zipfile.ZipFile) -> None:
+    index = ff.index_zip(export_zip)
+    assert index.root == EXPORT
+    assert [f.name for f in index.folders] == [
+        "80004215 - Anshuman", "80011485", "80013618", "80608_sign.pdf", "99999999"]
+    folder = index.by_id["80013618"][0]
+    assert (folder.files, folder.size) == (2, 10)
+    assert index.by_id["80004215"][0].name == "80004215 - Anshuman"
+    assert index.by_id["80608"][0].name == "80608_sign.pdf"
+    assert not any("__MACOSX" in m.filename or ".DS_Store" in m.filename
+                   for f in index.folders for m in f.members)
+
+
+def test_index_zip_without_wrapper_and_single_employee() -> None:
+    flat = ff.index_zip(make_zip({"80013618/a.jpg": b"1", "80011485/b.jpg": b"2"}))
+    assert flat.root == ""
+    assert sorted(flat.by_id) == ["80011485", "80013618"]
+
+    single = make_zip({"80013618/a.jpg": b"1", "80013618/b.pdf": b"2"})
+    assert ff.index_zip(single, known_ids={"80013618"}).by_id["80013618"][0].files == 2
+    # without knowing the ID the lone folder is treated as a wrapper
+    assert ff.index_zip(single).root == "80013618/"
+
+
+def test_build_zip_keeps_paths_of_selected_only(export_zip: zipfile.ZipFile) -> None:
+    index = ff.index_zip(export_zip)
+    chosen = index.by_id["80013618"] + index.by_id["80011485"] + index.by_id["80013618"]
+    out = io.BytesIO()
     seen: list[tuple[int, int]] = []
 
-    result = ff.export_selection(
-        rows, "Employee ID", index, ff.default_output_dir(export), make_zip=True,
-        progress=lambda i, total, _name: seen.append((i, total)),
-    )
+    assert ff.build_zip(export_zip, index, chosen, out, progress=lambda i, t: seen.append((i, t))) == 4
 
-    assert result.out_dir == tmp_path / "Export-2026-09-23 (1)_filtered"
-    assert sorted(p.name for p in result.out_dir.iterdir()) == [
-        "80011485", "80013618", "80608_sign.pdf", "filtered_list.xlsx"]
-    assert (result.out_dir / "80013618" / "photo.jpg").read_bytes() == b"jpg"
-    assert result.missing_ids == []
-    assert seen == [(1, 3), (2, 3), (3, 3)]
-    assert (export / "99999999").is_dir()  # source untouched
-
-    report = pd.read_excel(result.report, dtype=str)
-    assert list(report[ff.FOLDER_FOUND_COLUMN]) == ["Yes", "Yes", "Yes"]
-
-    with zipfile.ZipFile(result.zip_path) as zf:
-        names = zf.namelist()
-    assert "Export-2026-09-23 (1)_filtered/80013618/photo.jpg" in names
-    assert not any("99999999" in n for n in names)
-
-    # a second run never overwrites the first
-    again = ff.export_selection(rows.iloc[:1], "Employee ID", index, ff.default_output_dir(export))
-    assert again.out_dir.name == "Export-2026-09-23 (1)_filtered (2)"
-    assert again.zip_path is None
+    with zipfile.ZipFile(out) as result:
+        assert sorted(result.namelist()) == sorted([
+            EXPORT, f"{EXPORT}80011485/", f"{EXPORT}80011485/notes.txt", f"{EXPORT}80011485/photo.jpg",
+            f"{EXPORT}80013618/", f"{EXPORT}80013618/id_proof.pdf", f"{EXPORT}80013618/photo.jpg",
+        ])
+        assert result.read(f"{EXPORT}80013618/id_proof.pdf") == b"pdf-1"
+        assert result.read(f"{EXPORT}80011485/notes.txt") == b"text " * 100
+        assert result.getinfo(f"{EXPORT}80013618/photo.jpg").compress_type == zipfile.ZIP_STORED
+        assert result.getinfo(f"{EXPORT}80011485/notes.txt").compress_type == zipfile.ZIP_DEFLATED
+        assert result.testzip() is None
+    assert seen[-1] == (4, 4)
+    # the source archive is still readable afterwards
+    assert export_zip.read(f"{EXPORT}80013618/photo.jpg") == b"jpg-1"
 
 
-def test_export_reports_missing_folders(workbook: Path, tmp_path: Path) -> None:
-    df = ff.combine_sheets(ff.load_workbook(workbook), ["tc"])
-    empty_export = tmp_path / "empty"
-    empty_export.mkdir()
-    result = ff.export_selection(df, "Employee ID", ff.scan_export(empty_export), tmp_path / "out")
-    assert result.copied == []
-    assert result.missing_ids == ["80013618", "80011485", "80608"]
-    missing = pd.read_excel(result.report, sheet_name="Missing folders", dtype=str)
-    assert list(missing["Employee ID"]) == ["80013618", "80011485", "80608"]
+def test_selected_list_xlsx(df: pd.DataFrame) -> None:
+    back = pd.read_excel(io.BytesIO(ff.selected_list_xlsx(df.iloc[:2])), dtype=str)
+    assert list(back["Employee ID"]) == ["80013618", "80011485"]

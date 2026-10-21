@@ -1,8 +1,8 @@
 [server]
-# Only this computer can open the app (it reads and copies local folders).
+# Only this computer can open the app: employee documents never leave it.
 address = "localhost"
 showEmailPrompt = false
-maxUploadSize = 200
+maxUploadSize = 4096  # MB; the documents ZIP can be large
 
 [browser]
 gatherUsageStats = false

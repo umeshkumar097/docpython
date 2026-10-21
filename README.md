@@ -1,16 +1,16 @@
-# Employee folder filter
+# Employee documents filter
 
-Doc-status Excel mein filter lagao (Phase, Residential State, Batch, Employer,
-Registration Date, pasted Employee IDs ...) aur export folder se **sirf unhi
-employees ke folders** ek naye folder / ZIP mein copy karo. Jitne filters,
-utna hi data. Original export folder kabhi change nahi hota.
+Doc-status Excel / CSV aur documents ki ZIP (har employee ka folder = Employee ID) upload
+karo, **Batch / Language / Education / Month** filter lagao, rows select karo aur sirf
+selected employees ke folders ek nayi ZIP mein download karo, bilkul usi structure mein
+jaisi upload ki thi.
 
 ```
-Export-2026-09-23 (1)/            <- portal se aaya export (folder = Employee ID)
-  80013618/  80011485/  ...
-Export-2026-09-23 (1)_filtered/   <- app banata hai: sirf filtered employees
-  80013618/  ...  filtered_list.xlsx
-Export-2026-09-23 (1)_filtered.zip
+export.zip (upload)                       export_selected_49.zip (download)
+  Export-2026-09-23 (1)/                    Export-2026-09-23 (1)/
+    80013618/  photo.jpg  id_proof.pdf        80013618/  photo.jpg  id_proof.pdf
+    80011485/  ...                            ...  (sirf selected employees)
+    ...
 ```
 
 ## Chalana (Mac)
@@ -30,22 +30,23 @@ streamlit run app.py
 
 ## Use kaise karein
 
-1. **Excel**: doc status `.xlsx` upload karo. Saari sheets (jaise `tc`, `field`) ek saath aati hain;
-   `Sheet` column se sheet ka filter bhi lag sakta hai.
-2. **Export folder**: folder ka path paste karo. Finder mein folder par right-click, Option key
-   dabaye rakho, **Copy "…" as Pathname**. (Folder ko Terminal mein drag karke bhi path milta hai;
-   wo `\ ` wala path bhi chalega.)
-3. **Filters**: "Filter by columns" mein columns chuno; har column ka apna filter aata hai.
-   - Alag columns = AND (Phase = Batch 01 **aur** State = HARYANA).
-   - Ek column ke andar chuni values = OR (Batch 01 **ya** Batch 02).
-   - Date columns (Registration Date) par date range, bahut zyada values wale columns
-     (Name, Email) par "contains" search.
-   - "Ignore case and extra spaces" on ho to `Home credit `, `HOME CREDIT` ek hi value hain.
-   - Employee IDs box mein IDs paste karke sirf unhe le sakte ho.
-   - Folder status: sirf jinka folder mila / sirf jinka folder missing hai.
-4. **Copy / download**: "Copy N folders" dabao. Naya folder (+ ZIP) export ke bagal mein banta hai,
-   saath mein `filtered_list.xlsx` (filtered rows + "Folder found" Yes/No, aur missing IDs ki sheet).
-   500 MB tak ka ZIP browser se bhi download ho jata hai.
+1. **Upload**: doc status Excel (`.xlsx`) ya CSV, aur documents ki ZIP.
+   - Saari sheets (jaise `tc`, `field`) ek saath aati hain.
+   - **Sirf wahi employees aage aate hain jinka folder ZIP mein Employee ID se match hota hai.**
+     Baaki Excel rows skip ho jaati hain ("Skipped Excel rows" mein dikhti hain), aur ZIP ke jin
+     folders ki ID Excel mein nahi hai wo bhi alag dikhte hain.
+2. **Filters**: Batch, Language, Education, Month. Har filter mein sheet ki values unke count ke
+   saath aati hain (Excel ke column filter jaisa). Ek filter mein kai values = OR, alag filters = AND.
+   - Settings mein badal sakte ho ki kaunsa filter kis column se bane. Default:
+     Batch = `MD_Dra Batch`, Language = `MD_..._Language`, Education = `Selected Qualification`,
+     Month = `MD_Upload Month` (date column chuno to "July 2026" jaise months ban jaate hain).
+   - "Ignore case, spaces, _ and -" on ho to `UNDERGRADUATE`, `Under Graduate`, `Under_GRADUATE`
+     ek hi value hain.
+   - "More filters" mein koi bhi aur column, ya Employee IDs paste karke filter.
+3. **Select**: table mein sab rows pehle se ticked hoti hain; jinko nahi chahiye unka tick hatao
+   (Select all / Clear all bhi hai). Upar dikhta hai kitne employees, kitne documents, kitna MB.
+4. **Download**: "Download ZIP" se selected employees ke folders, same paths ke saath.
+   "Download selected list (.xlsx)" se unki Excel list.
 
 ## Folder aur Employee ID kaise match hote hain
 
@@ -53,14 +54,15 @@ streamlit run app.py
   (`080608` = `80608`).
 - `80013618 - Somanath` jaise folder ya `80013618_photo.jpg` jaisi files bhi apne shuru wale number
   se match hoti hain.
-- Agar folders kisi aur number se bane hain (jaise registration / application number), sidebar mein
-  **Employee ID column** badal kar wo column chuno.
-- App dikhata hai: Excel mein hai par folder nahi mila, aur folder hai par Excel mein ID nahi mili.
+- ZIP ke andar ek bahari folder ho (`Export-2026-09-23 (1)/`) ya na ho, dono chalte hain.
+  `__MACOSX` aur `.DS_Store` jaisi faltu files ignore hoti hain.
+- Agar folders kisi aur number se bane hain, Settings mein **Employee ID column** badlo.
 
 ## Data
 
-App sirf isi computer par khulta hai (`localhost`). Excel, ZIP aur `_filtered` folders
-`.gitignore` mein hain, kabhi git mein commit nahi hote.
+App sirf isi computer par khulta hai (`localhost`); files kahin upload nahi hoti. ZIP 4 GB tak
+upload ho sakti hai (`.streamlit/config.toml`). Excel, CSV aur ZIP `.gitignore` mein hain, kabhi
+git mein commit nahi hote.
 
 ## Tests
 

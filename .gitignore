@@ -4,7 +4,6 @@
 *.xls
 *.csv
 *.zip
-*_filtered*/
 
 .venv/
 __pycache__/

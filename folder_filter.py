@@ -1,49 +1,72 @@
-"""Core logic: read the status Excel, filter its rows, find the matching
-employee-ID folders in an export and copy / zip only those.
+"""Core logic: read the doc-status Excel / CSV, filter its rows, find each
+employee's folder inside the uploaded documents ZIP and write a new ZIP with
+only the selected employees' folders (same paths as the original).
 
-Kept free of any UI code so it can be tested on its own (tests/) and reused
-from a script.
+Kept free of any UI code so it can be tested on its own (tests/).
 """
 
 from __future__ import annotations
 
+import io
 import re
 import shutil
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date
-from pathlib import Path
 from typing import BinaryIO, Callable, Iterable
 
 import pandas as pd
 
 BLANK_LABEL = "(blank)"
 SHEET_COLUMN = "Sheet"
-FOLDER_FOUND_COLUMN = "Folder found"
 ID_COLUMN_HINTS = ("employee id", "emp id", "employee code", "emp code", "employeeid", "empid")
 
 # A column with more distinct values than this gets a "contains" search box
 # instead of a value list (names, emails, ID numbers ...).
 MAX_LIST_VALUES = 500
 
+# The four main filters and the column-name words that find their column,
+# best tier first ("Batch" falls back to a Phase column, "Month" to a date).
+QUICK_FILTERS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "Batch": (("batch",), ("phase",)),
+    "Language": (("language",),),
+    "Education": (("education", "qualification"), ("category",)),
+    "Month": (("month",), ("date",)),
+}
+
+# Already-compressed formats are stored as-is in the output ZIP (fast, same size).
+STORED_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".pdf", ".zip", ".rar", ".7z",
+    ".mp4", ".mov", ".docx", ".xlsx", ".pptx",
+}
+JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
 
 # --------------------------------------------------------------------------
-# Excel
+# Excel / CSV
 # --------------------------------------------------------------------------
 
 
-def load_workbook(source: str | Path | BinaryIO) -> dict[str, pd.DataFrame]:
-    """Every sheet of the workbook, all cells as text.
+def _tidy(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(how="all").reset_index(drop=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def load_table(data: bytes, filename: str) -> dict[str, pd.DataFrame]:
+    """Sheets of an .xlsx, or one 'CSV' sheet, with every cell as text.
 
     Reading as text keeps IDs exactly as typed (no 8.0013618e7, no lost
     leading zeros). Fully empty rows are dropped, header names trimmed.
     """
-    sheets = pd.read_excel(source, sheet_name=None, dtype=str, engine="openpyxl")
-    out: dict[str, pd.DataFrame] = {}
-    for name, df in sheets.items():
-        df = df.dropna(how="all").reset_index(drop=True)
-        df.columns = [str(c).strip() for c in df.columns]
-        out[str(name)] = df
-    return out
+    if filename.lower().endswith(".csv"):
+        try:
+            df = pd.read_csv(io.BytesIO(data), dtype=str, encoding="utf-8-sig")
+        except UnicodeDecodeError:  # saved by Excel on Windows
+            df = pd.read_csv(io.BytesIO(data), dtype=str, encoding="cp1252")
+        return {"CSV": _tidy(df)}
+    sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, dtype=str, engine="openpyxl")
+    return {str(name): _tidy(df) for name, df in sheets.items()}
 
 
 def combine_sheets(sheets: dict[str, pd.DataFrame], names: Iterable[str]) -> pd.DataFrame:
@@ -72,8 +95,21 @@ def guess_id_column(columns: Iterable[str]) -> str | None:
     return loose[0] if loose else None
 
 
+def guess_filter_column(df: pd.DataFrame, filter_name: str) -> str | None:
+    """Best column for one of QUICK_FILTERS: within the first tier of words
+    that matches any column, the column with the most filled cells."""
+    for words in QUICK_FILTERS[filter_name]:
+        matches = [
+            c for c in df.columns
+            if c != SHEET_COLUMN and any(w in c.lower() for w in words)
+        ]
+        if matches:
+            return max(matches, key=lambda c: df[c].map(lambda v: clean_value(v, True) != "").sum())
+    return None
+
+
 # --------------------------------------------------------------------------
-# IDs and the export folder
+# IDs
 # --------------------------------------------------------------------------
 
 
@@ -102,13 +138,9 @@ def parse_id_list(text: str) -> list[str]:
     return list(seen)
 
 
-def entry_keys(path: Path) -> set[str]:
-    """IDs a folder (or file) in the export answers to.
-
-    '80013618' -> {'80013618'}; '80013618 - Somanath' and '80013618_photo.jpg'
-    also answer to their leading number.
-    """
-    name = path.name if path.is_dir() else path.stem
+def name_keys(name: str) -> set[str]:
+    """IDs a folder / file name answers to: '80013618' -> {'80013618'};
+    '80013618 - Somanath' and '80013618_photo' also answer to their leading number."""
     keys = {normalize_id(name)}
     leading = re.match(r"\s*(\d+)", name)
     if leading:
@@ -117,27 +149,8 @@ def entry_keys(path: Path) -> set[str]:
     return keys
 
 
-def clean_path_input(raw: str) -> Path:
-    """A path typed or pasted by the user: tolerates surrounding quotes, '~'
-    and the backslash escapes macOS Terminal adds when a folder is dropped in."""
-    text = (raw or "").strip().strip("'\"").strip()
-    path = Path(text).expanduser()
-    if not path.exists() and "\\" in text:
-        unescaped = Path(re.sub(r"\\(.)", r"\1", text)).expanduser()
-        if unescaped.exists():
-            return unescaped
-    return path
-
-
-def scan_export(root: Path) -> dict[str, list[Path]]:
-    """ID -> the folders / files directly inside `root` named after it."""
-    index: dict[str, list[Path]] = {}
-    for entry in sorted(root.iterdir(), key=lambda p: p.name):
-        if entry.name.startswith((".", "~$")):
-            continue  # .DS_Store, Excel lock files
-        for key in entry_keys(entry):
-            index.setdefault(key, []).append(entry)
-    return index
+def id_keys(df: pd.DataFrame, id_column: str) -> pd.Series:
+    return df[id_column].map(normalize_id)
 
 
 # --------------------------------------------------------------------------
@@ -146,27 +159,13 @@ def scan_export(root: Path) -> dict[str, list[Path]]:
 
 
 def clean_value(value: object, ignore_case: bool) -> str:
-    """Value used for matching: extra spaces collapsed, optionally case-folded,
-    so 'Home credit ' and 'HOME CREDIT' can count as the same choice."""
+    """Value used for matching. With `ignore_case`, case, spaces, '_', '-' and
+    '.' are ignored, so 'UNDERGRADUATE', 'Under Graduate' and 'Under_GRADUATE'
+    are one choice."""
     if value is None or (not isinstance(value, str) and pd.isna(value)):
         return ""
     text = " ".join(str(value).split())
-    return text.casefold() if ignore_case else text
-
-
-def value_options(series: pd.Series, ignore_case: bool) -> list[tuple[str, str, int]]:
-    """(key, label, count) for every distinct value, sorted by label.
-
-    The label is the most common original spelling; the blank key is ''.
-    """
-    keys = series.map(lambda v: clean_value(v, ignore_case))
-    shown = series.map(lambda v: clean_value(v, False))
-    options = []
-    for key, group in shown.groupby(keys, sort=False):
-        label = group.value_counts().index[0] if key else BLANK_LABEL
-        options.append((key, label, len(group)))
-    options.sort(key=lambda o: (o[0] == "", o[1].casefold(), o[1]))
-    return options
+    return re.sub(r"[\s_.\-]+", "", text).casefold() if ignore_case else text
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
@@ -191,6 +190,51 @@ def is_date_column(name: str, series: pd.Series) -> bool:
     return parse_dates(filled).notna().mean() >= 0.8
 
 
+def month_values(name: str, series: pd.Series) -> pd.Series:
+    """Values for the Month filter: a date column becomes 'July 2026'; a
+    text column ('July 2026', 'Sept batch') is used as it is."""
+    if not is_date_column(name, series):
+        return series
+    parsed = parse_dates(series)
+    return parsed.dt.strftime("%B %Y").where(parsed.notna(), series)
+
+
+def _month_sort_key(label: str) -> tuple[int, pd.Timestamp | None, str]:
+    for fmt in ("%B %Y", "%b %Y"):
+        when = pd.to_datetime(label, format=fmt, errors="coerce")
+        if not pd.isna(when):
+            return (0, when, label)
+    return (1, None, label.casefold())
+
+
+def value_options(
+    series: pd.Series, ignore_case: bool, chronological: bool = False
+) -> list[tuple[str, str, int]]:
+    """(key, label, count) for every distinct value: blanks last, months in
+    calendar order when `chronological`, otherwise A-Z.
+
+    The label is the most common original spelling; the blank key is ''.
+    """
+    keys = series.map(lambda v: clean_value(v, ignore_case))
+    shown = series.map(lambda v: clean_value(v, False))
+    options = []
+    for key, group in shown.groupby(keys, sort=False):
+        label = group.value_counts().index[0] if key else BLANK_LABEL
+        options.append((key, label, len(group)))
+    if chronological:
+        options.sort(key=lambda o: (o[0] == "", _month_sort_key(o[1])))
+    else:
+        options.sort(key=lambda o: (o[0] == "", o[1].casefold(), o[1]))
+    return options
+
+
+def values_mask(series: pd.Series, keys: Iterable[str], ignore_case: bool) -> pd.Series:
+    wanted = set(keys)
+    if not wanted:
+        return pd.Series(True, index=series.index)
+    return series.map(lambda v: clean_value(v, ignore_case) in wanted)
+
+
 @dataclass
 class ColumnFilter:
     """One column's condition. Several filters combine with AND; the values
@@ -213,101 +257,157 @@ def filter_mask(df: pd.DataFrame, filters: Iterable[ColumnFilter], ignore_case: 
             continue
         col = df[f.column]
         if f.values:
-            wanted = set(f.values)
-            mask &= col.map(lambda v: clean_value(v, ignore_case) in wanted)
+            mask &= values_mask(col, f.values, ignore_case)
         if f.contains:
-            terms = [t.casefold() for t in (clean_value(t, False) for t in f.contains) if t]
+            terms = [clean_value(t, True) for t in f.contains]
+            terms = [t for t in terms if t]
             if terms:
                 mask &= col.map(lambda v: any(t in clean_value(v, True) for t in terms))
         if f.date_from or f.date_to:
             days = parse_dates(col).dt.date
             ok = days.notna()
             if f.date_from:
-                ok &= days.map(lambda d: d is not None and not pd.isna(d) and d >= f.date_from)
+                ok &= days.map(lambda d: not pd.isna(d) and d >= f.date_from)
             if f.date_to:
-                ok &= days.map(lambda d: d is not None and not pd.isna(d) and d <= f.date_to)
+                ok &= days.map(lambda d: not pd.isna(d) and d <= f.date_to)
             mask &= ok
     return mask
 
 
-def id_keys(df: pd.DataFrame, id_column: str) -> pd.Series:
-    return df[id_column].map(normalize_id)
+# --------------------------------------------------------------------------
+# Documents ZIP
+# --------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------
-# Export
-# --------------------------------------------------------------------------
+def _parts(info: zipfile.ZipInfo) -> list[str]:
+    return [p for p in info.filename.replace("\\", "/").split("/") if p]
+
+
+def is_junk(info: zipfile.ZipInfo) -> bool:
+    """macOS / Windows clutter that is never an employee's document."""
+    parts = _parts(info)
+    return (
+        not parts
+        or parts[0] == "__MACOSX"
+        or parts[-1] in JUNK_NAMES
+        or parts[-1].startswith(("._", "~$"))
+    )
+
+
+@dataclass(eq=False)  # identity: the same folder object is chosen once
+class ZipFolder:
+    """One employee entry: a folder (or a single file) at the top of the ZIP,
+    below any wrapper folder such as 'Export-2026-09-23 (1)/'."""
+
+    name: str
+    members: list[zipfile.ZipInfo]
+    keys: set[str]
+
+    @property
+    def files(self) -> int:
+        return sum(1 for m in self.members if not m.is_dir())
+
+    @property
+    def size(self) -> int:
+        return sum(m.file_size for m in self.members)
 
 
 @dataclass
-class ExportResult:
-    out_dir: Path
-    copied: list[Path]
-    missing_ids: list[str]
-    report: Path
-    zip_path: Path | None = None
+class ZipIndex:
+    root: str  # shared wrapper path ('Export-2026-09-23 (1)/') or ''
+    root_dirs: list[zipfile.ZipInfo]  # the wrapper's own directory entries
+    folders: list[ZipFolder]
+    by_id: dict[str, list[ZipFolder]]
 
 
-def default_output_dir(source: Path) -> Path:
-    """Next to the export; `unique_dir` adds (2), (3) ... on later runs."""
-    return source.parent / f"{source.name}_filtered"
+def index_zip(zf: zipfile.ZipFile, known_ids: Iterable[str] = ()) -> ZipIndex:
+    """Find the employee folders inside the ZIP.
 
-
-def unique_dir(path: Path) -> Path:
-    """`path`, or `path (2)`, `path (3)` ... whichever does not exist yet."""
-    candidate, n = path, 2
-    while candidate.exists() or candidate.with_name(candidate.name + ".zip").exists():
-        candidate = path.with_name(f"{path.name} ({n})")
-        n += 1
-    return candidate
-
-
-def export_selection(
-    rows: pd.DataFrame,
-    id_column: str,
-    index: dict[str, list[Path]],
-    out_dir: Path,
-    make_zip: bool = False,
-    progress: Callable[[int, int, str], None] | None = None,
-) -> ExportResult:
-    """Copy the folders of every employee in `rows` into `out_dir`, write
-    filtered_list.xlsx next to them and optionally zip the lot.
-
-    Nothing in the source export is changed.
+    Wrapper folders that hold everything ('Export-2026-09-23 (1)/') are
+    looked through, unless the single folder is itself a known employee ID.
     """
-    out_dir = unique_dir(out_dir)
-    out_dir.mkdir(parents=True)
+    known = set(known_ids)
+    infos = [i for i in zf.infolist() if not is_junk(i)]
+    paths = [_parts(i) for i in infos]
 
-    keys = list(dict.fromkeys(k for k in id_keys(rows, id_column) if k))
-    missing = [k for k in keys if k not in index]
-    sources = list(dict.fromkeys(p for k in keys for p in index.get(k, [])))
+    root: list[str] = []
+    while True:
+        depth = len(root)
+        tops = {p[depth] for p in paths if len(p) > depth}
+        if len(tops) != 1:
+            break
+        only = next(iter(tops))
+        is_file = any(len(p) == depth + 1 and not i.is_dir() for p, i in zip(paths, infos))
+        if is_file or name_keys(only) & known or not any(len(p) > depth + 1 for p in paths):
+            break
+        root.append(only)
 
-    copied: list[Path] = []
-    for i, src in enumerate(sources, start=1):
-        dest = out_dir / src.name
-        if src.is_dir():
-            shutil.copytree(src, dest)
+    depth = len(root)
+    root_dirs: list[zipfile.ZipInfo] = []
+    groups: dict[str, list[tuple[list[str], zipfile.ZipInfo]]] = {}
+    for p, info in zip(paths, infos):
+        if len(p) <= depth:
+            root_dirs.append(info)
         else:
-            shutil.copy2(src, dest)
-        copied.append(dest)
-        if progress:
-            progress(i, len(sources), src.name)
+            groups.setdefault(p[depth], []).append((p, info))
 
-    report = out_dir / "filtered_list.xlsx"
-    listed = rows.copy()
-    listed[FOLDER_FOUND_COLUMN] = id_keys(rows, id_column).map(
-        lambda k: "Yes" if k in index else "No"
+    folders: list[ZipFolder] = []
+    by_id: dict[str, list[ZipFolder]] = {}
+    for name in sorted(groups):
+        members = groups[name]
+        single_file = len(members) == 1 and len(members[0][0]) == depth + 1 and not members[0][1].is_dir()
+        stem = name.rsplit(".", 1)[0] if single_file and "." in name else name
+        folder = ZipFolder(name, [i for _, i in members], name_keys(stem))
+        folders.append(folder)
+        for key in folder.keys:
+            by_id.setdefault(key, []).append(folder)
+    return ZipIndex("".join(f"{r}/" for r in root), root_dirs, folders, by_id)
+
+
+def _copy_info(info: zipfile.ZipInfo) -> zipfile.ZipInfo:
+    """A fresh ZipInfo with the same name / date / permissions (writing
+    mutates a ZipInfo, so the source's own objects are never reused)."""
+    new = zipfile.ZipInfo(info.filename, info.date_time)
+    new.external_attr = info.external_attr
+    new.file_size = info.file_size
+    suffix = "." + info.filename.rsplit(".", 1)[-1].lower() if "." in info.filename else ""
+    new.compress_type = (
+        zipfile.ZIP_STORED if info.is_dir() or suffix in STORED_SUFFIXES else zipfile.ZIP_DEFLATED
     )
-    with pd.ExcelWriter(report, engine="openpyxl") as writer:
-        listed.to_excel(writer, sheet_name="Filtered rows", index=False)
-        if missing:
-            pd.DataFrame({id_column: missing}).to_excel(
-                writer, sheet_name="Missing folders", index=False
-            )
+    return new
 
-    zip_path = None
-    if make_zip:
-        zip_path = Path(
-            shutil.make_archive(str(out_dir), "zip", root_dir=out_dir.parent, base_dir=out_dir.name)
-        )
-    return ExportResult(out_dir, copied, missing, report, zip_path)
+
+def build_zip(
+    zf: zipfile.ZipFile,
+    index: ZipIndex,
+    folders: Iterable[ZipFolder],
+    out: BinaryIO,
+    progress: Callable[[int, int], None] | None = None,
+) -> int:
+    """Write the chosen folders, with exactly their original paths, into
+    `out` as a new ZIP. Returns the number of files written."""
+    chosen = list(dict.fromkeys(folders))
+    total = sum(f.files for f in chosen)
+    written = 0
+    with zipfile.ZipFile(out, "w", allowZip64=True) as dest:
+        for info in index.root_dirs:
+            if info.is_dir():
+                dest.writestr(_copy_info(info), b"")
+        for folder in chosen:
+            for info in folder.members:
+                new = _copy_info(info)
+                if info.is_dir():
+                    dest.writestr(new, b"")
+                    continue
+                with zf.open(info) as src, dest.open(new, "w") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                written += 1
+                if progress:
+                    progress(written, total)
+    return written
+
+
+def selected_list_xlsx(rows: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    rows.to_excel(buf, index=False, engine="openpyxl")
+    return buf.getvalue()
