@@ -6,4 +6,5 @@ if [ ! -d .venv ]; then
 fi
 source .venv/bin/activate
 pip install -q -r requirements.txt
-streamlit run app.py
+# localhost: only this computer can open the app; documents never leave it.
+streamlit run app.py --server.address localhost

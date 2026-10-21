@@ -25,7 +25,7 @@ Ya Terminal se (Mac / Windows / Linux):
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run app.py --server.address localhost
 ```
 
 ## Use kaise karein
@@ -60,9 +60,19 @@ streamlit run app.py
 
 ## Data
 
-App sirf isi computer par khulta hai (`localhost`); files kahin upload nahi hoti. ZIP 4 GB tak
-upload ho sakti hai (`.streamlit/config.toml`). Excel, CSV aur ZIP `.gitignore` mein hain, kabhi
-git mein commit nahi hote.
+Apne computer par (`run_mac.command` ya upar wali command) app sirf `localhost` par khulta hai;
+files kahin bahar nahi jaati. ZIP 4 GB tak upload ho sakti hai (`.streamlit/config.toml`).
+Excel, CSV aur ZIP `.gitignore` mein hain, kabhi git mein commit nahi hote.
+
+## Streamlit Community Cloud (share.streamlit.io) par deploy
+
+- Repo private hai, to Streamlit ko GitHub ki **private repos** ka access dena hota hai, warna repo
+  search mein nahi aata. Ya form mein **Paste GitHub URL** se `app.py` ka link do.
+- Branch: `main` (agar banaya hai) warna `claude/elegant-knuth-5lsezf`; Main file path: `app.py`.
+- Cloud par uploaded Excel / documents Streamlit ke servers par jaate hain (Aadhaar, PAN copies!):
+  app ko **private** rakho (sirf chune hue emails dekh sakein). Cloud ki memory kam hai
+  (lagbhag 1-2.7 GB), isliye badi ZIP (1 GB+) wahan crash kar sakti hai; badi ZIP ke liye apne
+  computer par chalao.
 
 ## Tests
 
