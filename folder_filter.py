@@ -48,9 +48,23 @@ JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 # --------------------------------------------------------------------------
 
 
+def unique_name(name: str, taken: Iterable[str]) -> str:
+    """`name`, or `name (2)`, `name (3)` ... whichever is not in `taken`."""
+    taken = set(taken)
+    candidate, n = name, 2
+    while candidate in taken:
+        candidate = f"{name} ({n})"
+        n += 1
+    return candidate
+
+
 def _tidy(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(how="all").reset_index(drop=True)
-    df.columns = [str(c).strip() for c in df.columns]
+    # Trimmed headers must stay unique: "Phase" and "Phase " become "Phase" and "Phase (2)".
+    names: list[str] = []
+    for column in df.columns:
+        names.append(unique_name(str(column).strip(), names))
+    df.columns = names
     return df
 
 
@@ -76,7 +90,8 @@ def combine_sheets(sheets: dict[str, pd.DataFrame], names: Iterable[str]) -> pd.
     for name in names:
         df = sheets[name].copy()
         if SHEET_COLUMN in df.columns:
-            df = df.rename(columns={SHEET_COLUMN: f"{SHEET_COLUMN} (original)"})
+            original = unique_name(f"{SHEET_COLUMN} (original)", df.columns)
+            df = df.rename(columns={SHEET_COLUMN: original})
         df.insert(0, SHEET_COLUMN, name)
         frames.append(df)
     if not frames:

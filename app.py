@@ -273,20 +273,23 @@ if buttons.button("Select all"):
 if buttons.button("Clear all"):
     st.session_state.update(select_all=False, table_reset=st.session_state.table_reset + 1)
 
+# The sheet may have its own "Select" / "Files in ZIP" columns: the app's get a free name.
+select_col = ff.unique_name(SELECT_COLUMN, rows.columns)
+files_col = ff.unique_name(FILES_COLUMN, [*rows.columns, select_col])
 table = rows.copy()
-table.insert(0, SELECT_COLUMN, st.session_state.select_all)
+table.insert(0, select_col, st.session_state.select_all)
 if index is not None:
     table.insert(
-        table.columns.get_loc(id_col) + 1, FILES_COLUMN,
+        table.columns.get_loc(id_col) + 1, files_col,
         keys[rows.index].map(lambda k: sum(f.files for f in index.by_id[k])),
     )
 edited = st.data_editor(
     table, hide_index=True, width="stretch", height=420,
-    disabled=[c for c in table.columns if c != SELECT_COLUMN],
-    column_config={SELECT_COLUMN: st.column_config.CheckboxColumn(SELECT_COLUMN, width="small")},
+    disabled=[c for c in table.columns if c != select_col],
+    column_config={select_col: st.column_config.CheckboxColumn(select_col, width="small")},
     key=widget_key("table", signature, st.session_state.table_reset),
 )
-selected = rows.loc[edited.index[edited[SELECT_COLUMN].astype(bool)]]
+selected = rows.loc[edited.index[edited[select_col].astype(bool)]]
 selected_ids = list(dict.fromkeys(k for k in keys[selected.index] if k))
 folders = (
     list(dict.fromkeys(f for k in selected_ids for f in index.by_id.get(k, [])))

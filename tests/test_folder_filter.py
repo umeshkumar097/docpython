@@ -98,6 +98,22 @@ def test_load_csv(encoding: str) -> None:
     assert sheets["CSV"]["City"][1] == "Café"
 
 
+def test_unique_name() -> None:
+    assert ff.unique_name("Select", ["Phase"]) == "Select"
+    assert ff.unique_name("Select", ["Select", "Select (2)"]) == "Select (3)"
+
+
+def test_headers_that_only_differ_by_spaces_stay_separate() -> None:
+    sheet = pd.DataFrame({"Employee ID": ["1"], "Phase": ["Batch 01"], "Phase ": ["Batch 02"],
+                          "Sheet": ["mine"], "Sheet (original)": ["also mine"]})
+    sheets = ff.load_table(xlsx_bytes({"tc": sheet}), "status.xlsx")
+    assert list(sheets["tc"].columns) == ["Employee ID", "Phase", "Phase (2)", "Sheet", "Sheet (original)"]
+    df = ff.combine_sheets(sheets, ["tc"])
+    assert list(df.columns) == [ff.SHEET_COLUMN, "Employee ID", "Phase", "Phase (2)",
+                                "Sheet (original) (2)", "Sheet (original)"]
+    assert df["Sheet (original) (2)"][0] == "mine" and df["Phase (2)"][0] == "Batch 02"
+
+
 def test_guess_id_column_prefers_main_column() -> None:
     assert ff.guess_id_column(["Name", "MD_Employee ID", "Employee ID"]) == "Employee ID"
     assert ff.guess_id_column(["MD_Employee ID ", "Name"]) == "MD_Employee ID "
