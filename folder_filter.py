@@ -13,14 +13,22 @@ import shutil
 import zipfile
 from pathlib import Path
 from dataclasses import dataclass, field
+from functools import lru_cache
 from datetime import date
-from typing import BinaryIO, Callable, Iterable
+from typing import BinaryIO, Callable, Iterable, Mapping
 
 import pandas as pd
 
 BLANK_LABEL = "(blank)"
 SHEET_COLUMN = "Sheet"
-ID_COLUMN_HINTS = ("employee id", "emp id", "employee code", "emp code", "employeeid", "empid")
+# Header names (lower case, letters and digits only) that hold employee IDs.
+ID_COLUMN_HINTS = (
+    "employeeid", "empid", "employeecode", "empcode", "employeeno", "empno",
+    "employeenumber", "staffid", "staffcode",
+)
+# A number this long anywhere in a folder name or an Excel ID can be the ID
+# ('SOMANATH_80013618', 'HC-80013618'); shorter runs are dates and counters.
+MIN_ID_DIGITS = 5
 
 # A column with more distinct values than this gets a "contains" search box
 # instead of a value list (names, emails, ID numbers ...).
@@ -99,14 +107,19 @@ def combine_sheets(sheets: dict[str, pd.DataFrame], names: Iterable[str]) -> pd.
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
+def _header_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
 def guess_id_column(columns: Iterable[str]) -> str | None:
-    """The column that holds employee IDs, preferring the main one over MD_ copies."""
+    """The column that holds employee IDs ('Employee ID', 'Employee_ID',
+    'Emp. Code' ...), preferring the main one over MD_ copies."""
     cols = list(columns)
     for wanted in ID_COLUMN_HINTS:
-        exact = [c for c in cols if c.strip().lower() == wanted]
+        exact = [c for c in cols if _header_key(c) == wanted]
         if exact:
             return exact[0]
-    loose = [c for c in cols if any(h in c.lower() for h in ID_COLUMN_HINTS)]
+    loose = [c for c in cols if any(h in _header_key(c) for h in ID_COLUMN_HINTS)]
     loose.sort(key=lambda c: c.lower().startswith("md_"))
     return loose[0] if loose else None
 
@@ -137,6 +150,10 @@ def normalize_id(value: object) -> str:
     text = str(value).strip()
     if text.lower() in ("", "nan", "none", "n/a", "na", "-"):
         return ""
+    if re.fullmatch(r"\d+(\.\d+)?[eE]\+?\d+", text):  # 8.0013618E+07 from a CSV
+        number = float(text)
+        if number.is_integer():
+            text = str(int(number))
     text = re.sub(r"\.0+$", "", text)
     text = re.sub(r"\s+", "", text)
     if text.isdigit():
@@ -154,19 +171,87 @@ def parse_id_list(text: str) -> list[str]:
     return list(seen)
 
 
-def name_keys(name: str) -> set[str]:
-    """IDs a folder / file name answers to: '80013618' -> {'80013618'};
-    '80013618 - Somanath' and '80013618_photo' also answer to their leading number."""
-    keys = {normalize_id(name)}
-    leading = re.match(r"\s*(\d+)", name)
+@lru_cache(maxsize=None)
+def name_keys(name: str, is_file: bool = False) -> frozenset[str]:
+    """IDs a folder or file name answers to.
+
+    '80013618', '80013618 - Somanath' and '80013618_photo.jpg' answer to
+    80013618. A folder such as 'SOMANATH_80013618' also answers to any number
+    of MIN_ID_DIGITS+ digits in it; a file only by its leading number, so a
+    phone photo like 'IMG_20260923_123456.jpg' never looks like an employee.
+    """
+    stem = name.rsplit(".", 1)[0] if is_file and "." in name else name
+    keys = {normalize_id(stem)}
+    leading = re.match(r"\s*(\d+)", stem)
     if leading:
         keys.add(normalize_id(leading.group(1)))
+    if not is_file:
+        keys.update(normalize_id(run) for run in re.findall(rf"\d{{{MIN_ID_DIGITS},}}", stem))
     keys.discard("")
-    return keys
+    return frozenset(keys)
+
+
+@lru_cache(maxsize=None)
+def number_keys(name: str) -> frozenset[str]:
+    """Every number in a folder name, however short ('VIBHA_8670' -> 8670).
+    Only used as a second pass, see index_zip."""
+    return frozenset(normalize_id(n) for n in re.findall(r"\d+", name))
+
+
+def id_candidates(value: object) -> list[str]:
+    """Keys an Excel ID can match, best first: the ID itself, then any
+    MIN_ID_DIGITS+ digit number in it ('HC-80013618' matches folder 80013618)."""
+    primary = normalize_id(value)
+    if not primary:
+        return []
+    runs = re.findall(rf"\d{{{MIN_ID_DIGITS},}}", primary)
+    return list(dict.fromkeys([primary, *(normalize_id(r) for r in runs)]))
+
+
+def known_ids(series: pd.Series) -> set[str]:
+    return {key for value in series for key in id_candidates(value)}
+
+
+def match_keys(series: pd.Series, by_id: Mapping[str, object] | None = None) -> pd.Series:
+    """Each row's ID key: the first candidate that has a folder in `by_id`,
+    else the plain normalized ID."""
+
+    def key(value: object) -> str:
+        candidates = id_candidates(value)
+        found = [c for c in candidates if by_id is not None and c in by_id]
+        return (found or candidates or [""])[0]
+
+    return series.map(key)
 
 
 def id_keys(df: pd.DataFrame, id_column: str) -> pd.Series:
-    return df[id_column].map(normalize_id)
+    return match_keys(df[id_column])
+
+
+def zip_name_keys(zf: zipfile.ZipFile) -> set[str]:
+    """Every ID that any folder or file name in the ZIP answers to, at any depth."""
+    keys: set[str] = set()
+    for info in zf.infolist():
+        if is_junk(info):
+            continue
+        parts = _parts(info)
+        for depth, part in enumerate(parts):
+            keys |= name_keys(part, depth == len(parts) - 1 and not info.is_dir())
+    return keys
+
+
+def count_matches(series: pd.Series, zip_keys: set[str]) -> int:
+    return int(series.map(lambda v: any(c in zip_keys for c in id_candidates(v))).sum())
+
+
+def best_id_column(df: pd.DataFrame, columns: Iterable[str], zip_keys: set[str]) -> tuple[str | None, int]:
+    """The column whose values match the most folder names in the ZIP."""
+    best, best_count = None, 0
+    for column in columns:
+        count = count_matches(df[column], zip_keys)
+        if count > best_count:
+            best, best_count = column, count
+    return best, best_count
 
 
 # --------------------------------------------------------------------------
@@ -312,12 +397,17 @@ def is_junk(info: zipfile.ZipInfo) -> bool:
 
 @dataclass(eq=False)  # identity: the same folder object is chosen once
 class ZipFolder:
-    """One employee entry: a folder (or a single file) at the top of the ZIP,
-    below any wrapper folder such as 'Export-2026-09-23 (1)/'."""
+    """One employee entry: a folder (or a single file) named after the
+    employee, wherever it sits in the ZIP ('Export (1)/80013618/',
+    'Export (1)/tc/80013618/', 'Photos/80013618.jpg')."""
 
-    name: str
+    path: tuple[str, ...]
     members: list[zipfile.ZipInfo]
-    keys: set[str]
+    keys: frozenset[str]
+
+    @property
+    def name(self) -> str:
+        return self.path[-1]
 
     @property
     def files(self) -> int:
@@ -331,53 +421,94 @@ class ZipFolder:
 @dataclass
 class ZipIndex:
     root: str  # shared wrapper path ('Export-2026-09-23 (1)/') or ''
-    root_dirs: list[zipfile.ZipInfo]  # the wrapper's own directory entries
+    root_dirs: list[zipfile.ZipInfo]  # directory entries above the employee folders
     folders: list[ZipFolder]
     by_id: dict[str, list[ZipFolder]]
+
+
+def _wrapper_depth(paths: list[tuple[str, ...]], infos: list[zipfile.ZipInfo], known: set[str]) -> int:
+    """How many single wrapper folders ('Export-2026-09-23 (1)/') hold everything."""
+    depth = 0
+    while True:
+        tops = {p[depth] for p in paths if len(p) > depth}
+        if len(tops) != 1:
+            return depth
+        only = next(iter(tops))
+        is_file = any(len(p) == depth + 1 and not i.is_dir() for p, i in zip(paths, infos))
+        if is_file or name_keys(only) & known or not any(len(p) > depth + 1 for p in paths):
+            return depth
+        depth += 1
+
+
+def _employee_level(path: tuple[str, ...], info: zipfile.ZipInfo, known: set[str]) -> int | None:
+    """Index of the first path part named after a known ID, if any."""
+    for depth, part in enumerate(path):
+        if name_keys(part, depth == len(path) - 1 and not info.is_dir()) & known:
+            return depth
+    return None
 
 
 def index_zip(zf: zipfile.ZipFile, known_ids: Iterable[str] = ()) -> ZipIndex:
     """Find the employee folders inside the ZIP.
 
-    Wrapper folders that hold everything ('Export-2026-09-23 (1)/') are
-    looked through, unless the single folder is itself a known employee ID.
+    A folder or file named after a known Excel ID is an employee entry at
+    whatever depth it sits, so extra wrapper folders, one sub-folder per
+    sheet, several exports in one ZIP or other files next to the export all
+    work. Everything else is grouped one level below the shared wrapper
+    folder(s), so it can be listed as "not in the Excel".
     """
     known = set(known_ids)
     infos = [i for i in zf.infolist() if not is_junk(i)]
-    paths = [_parts(i) for i in infos]
+    paths = [tuple(_parts(i)) for i in infos]
+    depth = _wrapper_depth(paths, infos, known)
 
-    root: list[str] = []
-    while True:
-        depth = len(root)
-        tops = {p[depth] for p in paths if len(p) > depth}
-        if len(tops) != 1:
-            break
-        only = next(iter(tops))
-        is_file = any(len(p) == depth + 1 and not i.is_dir() for p, i in zip(paths, infos))
-        if is_file or name_keys(only) & known or not any(len(p) > depth + 1 for p in paths):
-            break
-        root.append(only)
+    groups: dict[tuple[str, ...], list[zipfile.ZipInfo]] = {}
+    loose: list[tuple[tuple[str, ...], zipfile.ZipInfo]] = []
+    for path, info in zip(paths, infos):
+        level = _employee_level(path, info, known) if known else None
+        if level is None:
+            loose.append((path, info))
+        else:
+            groups.setdefault(path[:level + 1], []).append(info)
+    above = {prefix[:n] for prefix in groups for n in range(1, len(prefix))}
 
-    depth = len(root)
+    # Second pass: a short number inside a folder name ('VIBHA_8670') also
+    # counts, but never for the wrapper folders or a folder holding other
+    # employees' folders, so 'Export-2026-09-23 (1)' cannot pass for ID 2026.
+    still_loose = []
+    for path, info in loose:
+        dirs = len(path) if info.is_dir() else len(path) - 1
+        level = next(
+            (d for d in range(depth, dirs) if path[:d + 1] not in above and number_keys(path[d]) & known),
+            None,
+        ) if known else None
+        if level is None:
+            still_loose.append((path, info))
+        else:
+            groups.setdefault(path[:level + 1], []).append(info)
+
     root_dirs: list[zipfile.ZipInfo] = []
-    groups: dict[str, list[tuple[list[str], zipfile.ZipInfo]]] = {}
-    for p, info in zip(paths, infos):
-        if len(p) <= depth:
+    for path, info in still_loose:
+        if info.is_dir() and (len(path) <= depth or path in above):
             root_dirs.append(info)
         else:
-            groups.setdefault(p[depth], []).append((p, info))
+            groups.setdefault(path[:depth + 1], []).append(info)
 
     folders: list[ZipFolder] = []
     by_id: dict[str, list[ZipFolder]] = {}
-    for name in sorted(groups):
-        members = groups[name]
-        single_file = len(members) == 1 and len(members[0][0]) == depth + 1 and not members[0][1].is_dir()
-        stem = name.rsplit(".", 1)[0] if single_file and "." in name else name
-        folder = ZipFolder(name, [i for _, i in members], name_keys(stem))
+    for prefix in sorted(groups):
+        members = groups[prefix]
+        single_file = (
+            len(members) == 1 and len(_parts(members[0])) == len(prefix) and not members[0].is_dir()
+        )
+        keys = name_keys(prefix[-1], single_file)
+        if not keys & known and not single_file:
+            keys |= number_keys(prefix[-1]) & known  # matched in the second pass
+        folder = ZipFolder(prefix, members, keys)
         folders.append(folder)
         for key in folder.keys:
             by_id.setdefault(key, []).append(folder)
-    return ZipIndex("".join(f"{r}/" for r in root), root_dirs, folders, by_id)
+    return ZipIndex("".join(f"{r}/" for r in paths[0][:depth]) if paths else "", root_dirs, folders, by_id)
 
 
 def _copy_info(info: zipfile.ZipInfo) -> zipfile.ZipInfo:
@@ -405,9 +536,11 @@ def build_zip(
     chosen = list(dict.fromkeys(folders))
     total = sum(f.files for f in chosen)
     written = 0
+    # Only the directories above the chosen folders (e.g. the export's own folder).
+    above = {f.path[:n] for f in chosen for n in range(1, len(f.path))}
     with zipfile.ZipFile(out, "w", allowZip64=True) as dest:
         for info in index.root_dirs:
-            if info.is_dir():
+            if info.is_dir() and tuple(_parts(info)) in above:
                 dest.writestr(_copy_info(info), b"")
         for folder in chosen:
             for info in folder.members:

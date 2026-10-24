@@ -59,14 +59,20 @@ streamlit run app.py --server.address localhost
 
 ## How folders are matched to Employee IDs
 
-- The folder name is the value of the `Employee ID` column. Leading zeros, spaces and a trailing
-  `.0` are ignored (`080608` = `80608`).
-- A folder such as `80013618 - Somanath` or a file such as `80013618_photo.jpg` matches by its
-  leading number.
-- The ZIP may or may not have an outer folder (`Export-2026-09-23 (1)/`). Clutter such as
-  `__MACOSX` and `.DS_Store` is ignored.
-- If the folders are named after a different number, choose that column as the
-  **Employee ID column** in Settings.
+- A folder named after an employee's ID is found **wherever it sits in the ZIP**: directly inside
+  the export folder, inside one sub-folder per sheet (`Export/tc/80013618/`), in a ZIP holding
+  several exports, or next to other files such as the Excel itself.
+- The folder name may carry more than the ID: `80013618`, `80013618 - Somanath`,
+  `SOMANATH_80013618` and `VIBHA_8670` all match. Files named after the ID
+  (`Photos/80013618.jpg`, `80013618_sign.png`) match too.
+- Excel IDs are compared without leading zeros, spaces or a trailing `.0` (`080608` = `80608`);
+  `HC-80013618` and `8.0013618E+07` (from a CSV) also match folder `80013618`.
+- The **Employee ID column** is found from its header (`Employee ID`, `Employee_ID`, `Emp. Code`,
+  `Employee No` ...). If another column matches the ZIP's folder names better (for example an
+  application number), that column is used instead; the green message says which one.
+- If nothing matches, the app shows example values from the Excel column and example folder names
+  from the ZIP, so the difference is visible. Choose the right column in Settings.
+- Clutter such as `__MACOSX` and `.DS_Store` is ignored.
 
 ## Data
 

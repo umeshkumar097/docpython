@@ -156,6 +156,14 @@ if table_upload is None:
 
 sheets = read_table(table_upload.getvalue(), table_upload.name)
 
+zip_keys: set[str] | None = None
+if zip_file is not None:
+    try:
+        with zipfile.ZipFile(zip_file()) as zf:
+            zip_keys = ff.zip_name_keys(zf)
+    except (zipfile.BadZipFile, OSError):
+        st.error("This ZIP file cannot be opened. Create the ZIP again and choose it.")
+
 with st.expander("Settings: sheets, Employee ID column, filter columns"):
     set_left, set_right = st.columns(2)
     with set_left:
@@ -165,10 +173,15 @@ with st.expander("Settings: sheets, Employee ID column, filter columns"):
         st.stop()
     df = ff.combine_sheets(sheets, sheet_names)
     columns = [c for c in df.columns if c != ff.SHEET_COLUMN]
-    guessed_id = ff.guess_id_column(columns)
+    id_default = ff.guess_id_column(columns)
+    if zip_keys:
+        # If another column matches the ZIP's folder names better, start with that one.
+        best, best_count = ff.best_id_column(df, columns, zip_keys)
+        if best and best_count > (ff.count_matches(df[id_default], zip_keys) if id_default else 0):
+            id_default = best
     with set_right:
         id_col = st.selectbox(
-            "Employee ID column", columns, index=columns.index(guessed_id) if guessed_id else 0,
+            "Employee ID column", columns, index=columns.index(id_default) if id_default else 0,
             help="Values in this column are matched with the folder names in the ZIP.",
         )
         ignore_case = st.checkbox(
@@ -185,27 +198,32 @@ with st.expander("Settings: sheets, Employee ID column, filter columns"):
             format_func=lambda c: "(none)" if c is None else c, key=widget_key("qcol", name, *columns),
         )
 
-keys = ff.id_keys(df, id_col)
-
+excel_ids = ff.known_ids(df[id_col])
 index: ff.ZipIndex | None = None
-if zip_file is not None:
-    try:
-        with zipfile.ZipFile(zip_file()) as zf:
-            index = ff.index_zip(zf, known_ids=set(keys))
-    except (zipfile.BadZipFile, OSError):
-        st.error("This ZIP file cannot be opened. Create the ZIP again and choose it.")
+if zip_keys is not None:
+    with zipfile.ZipFile(zip_file()) as zf:
+        index = ff.index_zip(zf, known_ids=excel_ids)
+keys = ff.match_keys(df[id_col], index.by_id if index is not None else None)
 
 if index is not None:
     # Only employees whose folder is in the ZIP go further; the rest is skipped.
-    excel_ids = set(keys)
     matched = keys.map(lambda k: k in index.by_id)
     skipped = df[~matched]
     df, keys = df[matched], keys[matched]
+    orphans = ["/".join(f.path) for f in index.folders if not f.keys & excel_ids]
+    if df.empty:
+        excel_sample = ", ".join(skipped[id_col].dropna().astype(str).head(5)) or "(empty)"
+        st.error(
+            f"No folder in the ZIP matches the Excel column '{id_col}'.\n\n"
+            f"- Excel '{id_col}' values look like: {excel_sample}\n"
+            f"- ZIP folders look like: {', '.join(orphans[:5]) or '(no folders found)'}\n\n"
+            "Choose the column that holds the folder names as the Employee ID column in Settings."
+        )
+        st.stop()
     st.success(
-        f"Matched with the ZIP: {len(df)} employees. "
+        f"Matched with the ZIP by '{id_col}': {len(df)} employees. "
         f"{len(skipped)} Excel rows skipped (no folder in the ZIP)."
     )
-    orphans = [f.name for f in index.folders if not f.keys & excel_ids]
     info_left, info_right = st.columns(2)
     if len(skipped):
         with info_left.expander(f"Skipped Excel rows ({len(skipped)})"):
@@ -213,12 +231,6 @@ if index is not None:
     if orphans:
         with info_right.expander(f"ZIP folders not found in the Excel ({len(orphans)})"):
             st.write(", ".join(orphans))
-    if df.empty:
-        st.error(
-            f"No folder in the ZIP matches the Excel column '{id_col}'. "
-            "Choose the correct Employee ID column in Settings."
-        )
-        st.stop()
 
 # --------------------------------------------------------------------------
 # 2. Filters
@@ -252,8 +264,9 @@ with st.expander("More filters (any column, Employee IDs)"):
         placeholder="80013618, 80011485 ...  (one per line, or separated by commas / spaces)",
     ))
 if pasted:
-    mask &= keys.isin(pasted)
-    unknown = sorted(set(pasted) - set(keys))
+    wanted = {c for p in pasted for c in ff.id_candidates(p)}
+    mask &= keys.isin(wanted)
+    unknown = sorted(p for p in pasted if not set(ff.id_candidates(p)) & set(keys))
     if unknown:
         st.warning(f"{len(unknown)} pasted IDs did not match: {', '.join(unknown)}")
 

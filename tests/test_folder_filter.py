@@ -316,6 +316,88 @@ def test_find_zip_files_newest_first_without_own_outputs(tmp_path: Path) -> None
     assert [p.name for p in found] == ["new.zip", "old.zip"]
 
 
+# -- Matching real-world ZIP / Excel layouts ------------------------------------
+
+
+IDS = ["80013618", "80011485", "80004215"]
+
+
+def docs(prefix: str, folder: str) -> dict[str, bytes]:
+    return {f"{prefix}{folder}/photo.jpg": b"jpg", f"{prefix}{folder}/id_proof.pdf": b"pdf"}
+
+
+def matched_paths(zf: zipfile.ZipFile, excel_ids: list[str]) -> list[str]:
+    ids = pd.Series(excel_ids)
+    index = ff.index_zip(zf, known_ids=ff.known_ids(ids))
+    keys = ff.match_keys(ids, index.by_id)
+    return sorted("/".join(f.path) for k in keys for f in index.by_id.get(k, []))
+
+
+@pytest.mark.parametrize(
+    ("layout", "expected"),
+    [
+        ({**docs(EXPORT, IDS[0]), **docs(EXPORT, IDS[1]), **docs(EXPORT, IDS[2]), "doc_status.xlsx": b"x"},
+         [f"{EXPORT}{i}" for i in sorted(IDS)]),
+        ({**docs(f"{EXPORT}tc/", IDS[0]), **docs(f"{EXPORT}tc/", IDS[1]), **docs(f"{EXPORT}field/", IDS[2])},
+         [f"{EXPORT}field/{IDS[2]}", f"{EXPORT}tc/{IDS[1]}", f"{EXPORT}tc/{IDS[0]}"]),
+        ({**docs(EXPORT, f"SOMANATH_{IDS[0]}"), **docs(EXPORT, f"AMANDEEP {IDS[1]}"), **docs(EXPORT, IDS[2])},
+         [f"{EXPORT}{IDS[2]}", f"{EXPORT}AMANDEEP {IDS[1]}", f"{EXPORT}SOMANATH_{IDS[0]}"]),
+        ({**docs("Export (1)/", IDS[0]), **docs("Export (2)/", IDS[1]), **docs("Export (2)/", IDS[2])},
+         [f"Export (1)/{IDS[0]}", f"Export (2)/{IDS[2]}", f"Export (2)/{IDS[1]}"]),
+        ({f"Photos/{i}.jpg": b"jpg" for i in IDS} | {f"Signatures/{i}_sign.png": b"png" for i in IDS},
+         sorted([f"Photos/{i}.jpg" for i in IDS] + [f"Signatures/{i}_sign.png" for i in IDS])),
+    ],
+    ids=["excel-next-to-export", "sheet-subfolders", "name-around-id", "two-exports", "grouped-by-type"],
+)
+def test_employee_folders_are_found_at_any_depth(layout: dict[str, bytes], expected: list[str]) -> None:
+    assert matched_paths(make_zip(layout), IDS) == sorted(expected)
+
+
+def test_short_ids_inside_folder_names_match_but_never_the_export_folder() -> None:
+    zf = make_zip({**docs(EXPORT, "VIBHA_8670"), **docs(EXPORT, IDS[0]), **docs(EXPORT, "OTHER_99")})
+    # 2026 and 23 appear in the export folder's own name; 99 is in a folder name below it
+    assert matched_paths(zf, ["8670", IDS[0], "2026", "23"]) == [f"{EXPORT}{IDS[0]}", f"{EXPORT}VIBHA_8670"]
+    index = ff.index_zip(zf, known_ids={"8670", "2026", "23", IDS[0]})
+    assert index.root == EXPORT and "2026" not in index.by_id and "23" not in index.by_id
+
+
+def test_excel_ids_with_prefix_or_scientific_notation_match() -> None:
+    zf = make_zip({**docs(EXPORT, IDS[0]), **docs(EXPORT, IDS[1])})
+    assert matched_paths(zf, [f"HC-{IDS[0]}", "8.0011485E+07"]) == [f"{EXPORT}{IDS[1]}", f"{EXPORT}{IDS[0]}"]
+
+
+def test_photo_names_inside_a_folder_never_look_like_employees() -> None:
+    zf = make_zip({f"{EXPORT}6076774/IMG_20260923_123456.jpg": b"x", f"{EXPORT}{IDS[0]}/a.jpg": b"x"})
+    index = ff.index_zip(zf, known_ids={"123456", IDS[0]})
+    assert sorted("/".join(f.path) for f in index.folders) == [f"{EXPORT}6076774", f"{EXPORT}{IDS[0]}"]
+    assert "123456" not in index.by_id
+
+
+def test_guess_id_column_reads_header_variants() -> None:
+    assert ff.guess_id_column(["Registration Date", "Employee_ID"]) == "Employee_ID"
+    assert ff.guess_id_column(["Name", "Emp. Code"]) == "Emp. Code"
+    assert ff.guess_id_column(["Name", "EMPLOYEE NO"]) == "EMPLOYEE NO"
+
+
+def test_best_id_column_follows_the_zip_folder_names() -> None:
+    df = pd.DataFrame({"Employee ID": IDS, "Application No": ["6076774", "6076656", "6076683"],
+                       "Pincode": ["400708", "122015", "560100"]})
+    zip_keys = ff.zip_name_keys(make_zip({**docs(EXPORT, "6076774"), **docs(EXPORT, "6076656")}))
+    assert ff.best_id_column(df, list(df.columns), zip_keys) == ("Application No", 2)
+    assert ff.count_matches(df["Employee ID"], zip_keys) == 0
+
+
+def test_build_zip_keeps_nested_paths_and_only_needed_parent_folders() -> None:
+    zf = make_zip({**docs(f"{EXPORT}tc/", IDS[0]), **docs(f"{EXPORT}field/", IDS[2])},
+                  dirs=(EXPORT, f"{EXPORT}tc/", f"{EXPORT}field/"))
+    index = ff.index_zip(zf, known_ids=set(IDS))
+    out = io.BytesIO()
+    ff.build_zip(zf, index, index.by_id[IDS[0]], out)
+    with zipfile.ZipFile(out) as result:
+        assert sorted(result.namelist()) == [
+            EXPORT, f"{EXPORT}tc/", f"{EXPORT}tc/{IDS[0]}/id_proof.pdf", f"{EXPORT}tc/{IDS[0]}/photo.jpg"]
+
+
 def test_selected_list_xlsx(df: pd.DataFrame) -> None:
     back = pd.read_excel(io.BytesIO(ff.selected_list_xlsx(df.iloc[:2])), dtype=str)
     assert list(back["Employee ID"]) == ["80013618", "80011485"]
